@@ -1,8 +1,9 @@
 import EventEmitter from "events";
-import https, { Server } from 'https';
+import https from 'https';
+import http from 'http';
 import WebSocket from "./websocket";
-import { ConnectionListener, Credentials } from "./types";
-import { TLSSocket } from "tls";
+import { ConnectionListener, Credentials, Pathname } from "./types";
+import { TLSSocket, Server } from "tls";
 import { IncomingMessage } from "http";
 import { Duplex } from "stream";
 
@@ -12,21 +13,25 @@ const port = 3000;
 export default class WebSocketServer extends EventEmitter {
 
     server: Server;
-    #serviceRoutes: string[];
+    #serviceRoute: Pathname;
+    #wildcardRoute: boolean;
+    #subProtocol: string;
     //activeConnections
 
-    constructor(credentials: Credentials, routes: string[], connectionListener?: ConnectionListener) { 
+    constructor(server: Server, route: Pathname, subProtocol?: string) { 
         super();
         
-        this.#serviceRoutes = routes;
-        this.server = https.createServer(credentials);
+        this.server = server;
+        this.#serviceRoute = route;
+        // this.#wildcardRoute = this.isWildcard(route);
+        this.#subProtocol = subProtocol;
 
-        // Attach main event listeners
+        // Start server and attach main event listeners
         this.server.listen(port, hostname, () => {
             console.log("WebSocket server running...");
         });
 
-        this.server.on('upgrade', (req, socket, head) => { // this
+        this.server.on('upgrade', (req, socket, head) => { 
             this.handleUpgrade(req, socket, head);
         });
 
@@ -36,18 +41,30 @@ export default class WebSocketServer extends EventEmitter {
     }
 
     handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): void {
-        if (!this.routeValid(req)) {
-            
-        } 
+  
     }
 
     routeValid(req: IncomingMessage): boolean {
         const url = new URL(req.url, `https://${req.headers.host}`);
-        return this.#serviceRoutes.includes(url.pathname);
+        return this.#serviceRoute === url.pathname;
     }
 
-    abort() {
-
+    abortUpgrade(statusCode: number, socket: Duplex): void {
+        const res = formatHttpResponse(statusCode);
+        socket.end(res, 'utf-8');
     }
 
+    // isWildcard(route: Pathname): boolean {
+ 
+    // }
+
+}
+
+function formatHttpResponse(statusCode: number): string {
+    const status = http.STATUS_CODES[statusCode];
+    const formattedResponse = 
+    `HTTPS/1.1 ${statusCode} ${status}\r\n
+    \r\n`;
+
+    return formattedResponse;
 }

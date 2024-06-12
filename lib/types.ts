@@ -8,3 +8,5 @@ export type Credentials = {
 }
 
 export type ConnectionListener = (ws: TLSSocket) => void;
+
+export type Pathname = `/${string}`;
