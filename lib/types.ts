@@ -10,3 +10,9 @@ export type Credentials = {
 export type ConnectionListener = (ws: TLSSocket) => void;
 
 export type Pathname = `/${string}`;
+
+export type WSSOptions = {
+    origins?: string[],
+    requireOrigin?: boolean,
+    subProtocol?: string
+}
