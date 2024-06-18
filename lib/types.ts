@@ -14,5 +14,5 @@ export type Pathname = `/${string}`;
 export type WSSOptions = {
     origins?: string[],
     requireOrigin?: boolean,
-    subProtocol?: string
+    subProtocols?: string[]
 }
