@@ -6,7 +6,7 @@ import { ConnectionListener, Credentials, Pathname, WSSOptions } from "./types";
 import { TLSSocket, Server } from "tls";
 import { IncomingMessage } from "http";
 import { Duplex } from "stream";
-import { formatHttpResponse } from "./util";
+import { formatHttpResponse, generateSecWebSocketAccept, isBase64Encoded } from "./util";
 
 const hostname = '127.0.0.1';
 const port = 3000;
@@ -18,7 +18,7 @@ export default class WebSocketServer extends EventEmitter {
     #wildcardRoute: boolean;
     #origins: string[];
     #requireOrigin: boolean;
-    #subProtocol: string;
+    #subProtocols: string[];
     //activeConnections
 
     constructor(server: Server, route: Pathname, options?: WSSOptions) { 
@@ -29,7 +29,7 @@ export default class WebSocketServer extends EventEmitter {
         // this.#wildcardRoute = this.isWildcard(route);
         this.#origins = options.origins;
         this.#requireOrigin = options.requireOrigin;
-        this.#subProtocol = options.subProtocol;
+        this.#subProtocols = options.subProtocols;
 
         // Start server and attach main event listeners
         this.server.listen(port, hostname, () => {
@@ -38,13 +38,12 @@ export default class WebSocketServer extends EventEmitter {
 
         this.server.on('upgrade', (req, socket, head) => { 
             console.log("in upgrade");
-            this.handleUpgrade(req, socket, head);
+            const url = new URL(req.url, `https://${req.headers.host}`);
+            if (url.pathname === route) {
+                this.handleUpgrade(req, socket, head);
+            }
         });
 
-        this.server.on('request', (req, res) => {
-            console.log("in req");
-            this.emit('request', req, res);
-        });
     }
 
     handleUpgrade(req: IncomingMessage, socket: TLSSocket, head: Buffer): void {
@@ -57,12 +56,25 @@ export default class WebSocketServer extends EventEmitter {
         } else if (this.versionInvalid(req)) {
             this.abort(426, socket, ['Sec-Websocket-Version: 13']);
         } else {
-            this.upgrade(req);
+            this.upgrade(req, socket);
         }
     }
 
-    upgrade(req: IncomingMessage): void {
+    // don't forget binding socket (data events no longer emitted)
+    upgrade(req: IncomingMessage, socket: TLSSocket): void {
+        const headers: string[] = [
+            'Upgrade: websocket', 
+            'Connection: Upgrade'
+        ];
 
+        // add the 'Sec-WebSocket-Accept' value to the headers
+       const acceptValue = generateSecWebSocketAccept(req.headers["sec-websocket-key"]);
+       headers.push(`Sec-WebSocket-Accept: ${acceptValue}`);
+
+        
+        // 101 Switching Protocols
+        const res = formatHttpResponse(101, headers);
+        socket.write(res, 'utf-8');
     }
 
     abort(statusCode: number, socket: TLSSocket, headers?: string[]): void {
@@ -102,13 +114,26 @@ export default class WebSocketServer extends EventEmitter {
 
         if (req.method !== 'GET') return true;
 
-        // uri?
-
-        //if (req.headers.host !== Server's Authority) {}
+        if (!req.url) return true;
+        
+        //if (req.headers.host !== Server's Authority) return true;
 
         if (req.headers.upgrade !== 'websocket') return true;
 
         if (req.headers.connection !== 'upgrade') return true;
+
+        if (this.invalidKey(req.headers["sec-websocket-key"])) return true;
+
+        return false;
+    }
+
+    invalidKey(key: string): boolean {
+        // must be base64 encoded
+        if (!isBase64Encoded(key)) return true;
+
+        // must be 16 bytes when decoded
+        if (key.length !== 24) return true;
+        if (key.substring(22) !== '==') return true;
 
         return false;
     }
