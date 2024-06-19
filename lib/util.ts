@@ -26,6 +26,15 @@ export function generateSecWebSocketAccept(key: string): string {
     const hash = crypto.createHash('sha1');
     hash.update(concatenated, 'base64');
     const buffer = hash.digest();
-    
+
     return buffer.toString('base64');
+}
+
+// returns the index of the last forward slash in a string
+export function lastSlash(str: string): number {
+    for (let i = str.length; i >= 0; i--) {
+        if (str[i] === '/') {
+            return i;
+        }
+    }
 }
