@@ -2,54 +2,79 @@ import EventEmitter from "events";
 import https from 'https';
 import http from 'http';
 import WebSocket from "./websocket";
-import { ConnectionListener, Credentials, Pathname, WSSOptions } from "./types";
 import { TLSSocket, Server } from "tls";
 import { IncomingMessage } from "http";
-import { Duplex } from "stream";
-import { formatHttpResponse, generateSecWebSocketAccept, isBase64Encoded } from "./util";
+import { 
+    ConnectionList, 
+    ConnectionListener, 
+    Credentials, 
+    Pathname, 
+    WSSOptions 
+} from "./types";
+import { 
+    formatHttpResponse, 
+    generateSecWebSocketAccept, 
+    isBase64Encoded, 
+    lastSlash 
+} from "./util";
 
 const hostname = '127.0.0.1';
 const port = 3000;
 
 export default class WebSocketServer extends EventEmitter {
 
-    server: Server;
+    // options
+    #noServer: boolean;
+    #origins: string[] | null;
+    #requireOrigin: boolean;
+    #subProtocols: string[] | null;
+
+    // server & metadata
+    #server: Server | null;
     #serviceRoute: Pathname;
     #wildcardRoute: boolean;
-    #origins: string[];
-    #requireOrigin: boolean;
-    #subProtocols: string[];
-    //activeConnections
+    #activeConnections: ConnectionList;
 
-    constructor(server: Server, route: Pathname, options?: WSSOptions) { 
+    constructor(server: Server | null, route: Pathname, options?: WSSOptions) { 
         super();
-        
-        this.server = server;
+
+        const optionValues: WSSOptions = {
+            noServer: false,
+            origins: null,
+            requireOrigin: false,
+            subProtocols: null,
+            ...options
+        };
+
+        // options
+        this.#noServer = optionValues.noServer;
+        this.#origins = optionValues.origins;
+        this.#requireOrigin = optionValues.requireOrigin;
+        this.#subProtocols = optionValues.subProtocols;
+
+        // server & metadata
+        this.#server = server;
         this.#serviceRoute = route;
-        // this.#wildcardRoute = this.isWildcard(route);
-        this.#origins = options.origins;
-        this.#requireOrigin = options.requireOrigin;
-        this.#subProtocols = options.subProtocols;
+        this.#wildcardRoute = this.isWildcard(route);
+        
+        if (!this.#noServer) {
+            // Start server and attach main event listeners
+            this.#server.listen(port, hostname, () => {
+                console.log(`WebSocket server running at https://${hostname}:${port}`);
+            });
 
-        // Start server and attach main event listeners
-        this.server.listen(port, hostname, () => {
-            console.log(`WebSocket server running at https://${hostname}:${port}`);
-        });
-
-        this.server.on('upgrade', (req, socket, head) => { 
-            console.log("in upgrade");
-            const url = new URL(req.url, `https://${req.headers.host}`);
-            if (url.pathname === route) {
-                this.handleUpgrade(req, socket, head);
-            }
-        });
-
+            this.#server.on('upgrade', (req, socket, head) => { 
+                if (this.validRoute(req)) {
+                    this.handleUpgrade(req, socket, head);
+                } else {
+                    this.abort(404, socket);
+                }
+            });
+        }
     }
 
     handleUpgrade(req: IncomingMessage, socket: TLSSocket, head: Buffer): void {
-        if (this.routeInvalid(req)) {
-            this.abort(404, socket);
-        } else if (this.originInvalid(req)) {
+        if (this.originInvalid(req)) {
             this.abort(403, socket);
         } else if (this.badRequest(req)) {
             this.abort(400, socket);
@@ -67,25 +92,34 @@ export default class WebSocketServer extends EventEmitter {
             'Connection: Upgrade'
         ];
 
-        // add the 'Sec-WebSocket-Accept' value to the headers
-       const acceptValue = generateSecWebSocketAccept(req.headers["sec-websocket-key"]);
-       headers.push(`Sec-WebSocket-Accept: ${acceptValue}`);
+        // add the 'Sec-WebSocket-Accept' value to the header
+        const acceptValue = generateSecWebSocketAccept(req.headers["sec-websocket-key"]);
+        headers.push(`Sec-WebSocket-Accept: ${acceptValue}`);
 
+        // negotiate protocol 
+
+        // RFC 6455 specifies that the client can list multiple protocols in order of preference, 
+        // but the IncomingMessage object only has one potential protocol, and is handled as such.
+
+        const requestedProtocol = req.headers["sec-websocket-protocol"];
+        if (this.#subProtocols?.includes(requestedProtocol)) {
+            headers.push(`Sec-WebSocket-Protocol: ${requestedProtocol}`);
+        }
         
         // 101 Switching Protocols
         const res = formatHttpResponse(101, headers);
         socket.write(res, 'utf-8');
+
+        // emit the connection event and pass the newly created WebSocket to the callback
+        const url = new URL(req.url, `https://${req.headers.host}`);
+        const ws = new WebSocket(socket, url.pathname); 
+        this.emit('connection', ws);
     }
 
     abort(statusCode: number, socket: TLSSocket, headers?: string[]): void {
         const res = formatHttpResponse(statusCode, headers);
         socket.write(res, 'utf-8');
         socket.end();
-    }
-
-    routeInvalid(req: IncomingMessage): boolean {
-        const url = new URL(req.url, `https://${req.headers.host}`);
-        return this.#serviceRoute !== url.pathname;
     }
 
     versionInvalid(req: IncomingMessage): boolean {
@@ -138,8 +172,64 @@ export default class WebSocketServer extends EventEmitter {
         return false;
     }
 
-    // isWildcard(route: Pathname): boolean {
- 
-    // }
+    // the ':' prefix to a path segment indicates a wildcard route
+    isWildcard(route: Pathname): boolean {
+        // find index of last '/' character; the next character must be ':' for true
+        const i = lastSlash(route);
+        return route[i + 1] === ':';
+    }
+
+    validRoute(req: IncomingMessage): boolean {
+        const url = new URL(req.url, `https://${req.headers.host}`);
+        const pathname = url.pathname;
+
+        // j = 1, i = 1 to skip '/' prefix
+        let j = 1;
+        let skipToNextSegment = false;
+        const slashIndex = lastSlash(this.#serviceRoute);
+        for (let i = 1; i < pathname.length; i++) {
+        
+            // increment indexes to next '/' in each string
+            while (skipToNextSegment) {
+                if (pathname[i] === '/' && this.#serviceRoute[j] === '/') {
+                    skipToNextSegment = false;
+                    continue;
+                } 
+
+                if (pathname[i] === '/' && this.#serviceRoute[j] !== '/') {
+                    j++;
+                }
+
+                if (pathname[i] !== '/' && this.#serviceRoute[j] === '/') {
+                    i++;
+                }
+
+                if (pathname[i] !== '/' && this.#serviceRoute[j] !== '/') {
+                    i++;
+                    j++;
+                }
+            }
+
+            // skip any wildcards
+            if (this.#serviceRoute[j] === ':' && (j - 1) !== slashIndex) {
+                skipToNextSegment = true;
+                continue;
+            }
+
+            // if we've reached the final wildcard segment, the route is valid
+            if (this.#serviceRoute[j] === ':') {
+                return true;
+            }
+
+            // if non-wildcard path segments are not identical, the route is invalid
+            if (pathname[i] !== this.#serviceRoute[j]) {
+                return false;
+            }
+
+            j++;
+        }
+
+        return true;
+    }
 
 }
