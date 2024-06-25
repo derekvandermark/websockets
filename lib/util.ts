@@ -1,6 +1,5 @@
 import http from 'http';
-import crypto from 'crypto';
-import { GUID } from './constants';
+import { Pathname } from './types';
 
 export function formatHttpResponse(statusCode: number, headers?: string[]): string {
     const statusText = http.STATUS_CODES[statusCode];
@@ -9,7 +8,7 @@ export function formatHttpResponse(statusCode: number, headers?: string[]): stri
     const formattedResponse = 
     `HTTPS/1.1 ${statusCode} ${statusText}\r\n
     Date: ${date}\r\n
-    ${headers.forEach((header) => `${header}\r\n`)}
+    ${headers?.forEach((header) => `${header}\r\n`)}
     \r\n`;
 
     return formattedResponse;
@@ -20,21 +19,14 @@ export function isBase64Encoded(str: string): boolean {
     return base64Regex.test(str);
 }
 
-export function generateSecWebSocketAccept(key: string): string {
-    const concatenated = key.concat(GUID);
-
-    const hash = crypto.createHash('sha1');
-    hash.update(concatenated, 'base64');
-    const buffer = hash.digest();
-
-    return buffer.toString('base64');
-}
-
 // returns the index of the last forward slash in a string
-export function lastSlash(str: string): number {
+export function lastSlash(str: Pathname): number {
     for (let i = str.length; i >= 0; i--) {
         if (str[i] === '/') {
             return i;
         }
     }
+
+    // should never reach here since arg must be type Pathname; default case is a '/' at index 0
+    return 0;
 }

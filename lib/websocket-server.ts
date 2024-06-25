@@ -1,19 +1,17 @@
 import EventEmitter from "events";
-import https from 'https';
-import http from 'http';
+import crypto from 'crypto';
 import WebSocket from "./websocket";
 import { TLSSocket, Server } from "tls";
 import { IncomingMessage } from "http";
+import { GUID } from './constants';
 import { 
     ConnectionList, 
-    ConnectionListener, 
-    Credentials, 
+    ValidRequest,
     Pathname, 
     WSSOptions 
 } from "./types";
 import { 
     formatHttpResponse, 
-    generateSecWebSocketAccept, 
     isBase64Encoded, 
     lastSlash 
 } from "./util";
@@ -24,30 +22,27 @@ const port = 3000;
 export default class WebSocketServer extends EventEmitter {
 
     // options
-    #noServer: boolean;
-    #origins: string[] | null;
+    #origins: string[] | undefined;
     #requireOrigin: boolean;
-    #subProtocols: string[] | null;
+    #subProtocols: string[] | undefined;
 
     // server & metadata
     #server: Server | null;
     #serviceRoute: Pathname;
     #wildcardRoute: boolean;
-    #activeConnections: ConnectionList;
+    //#activeConnections: ConnectionList;
 
     constructor(server: Server | null, route: Pathname, options?: WSSOptions) { 
         super();
 
-        const optionValues: WSSOptions = {
-            noServer: false,
-            origins: null,
+        const optionValues = {
+            origins: undefined,
             requireOrigin: false,
-            subProtocols: null,
+            subProtocols: undefined,
             ...options
         };
 
         // options
-        this.#noServer = optionValues.noServer;
         this.#origins = optionValues.origins;
         this.#requireOrigin = optionValues.requireOrigin;
         this.#subProtocols = optionValues.subProtocols;
@@ -55,45 +50,45 @@ export default class WebSocketServer extends EventEmitter {
         // server & metadata
         this.#server = server;
         this.#serviceRoute = route;
-        this.#wildcardRoute = this.isWildcard(route);
+        this.#wildcardRoute = this.#isWildcard(route);
         
-        if (!this.#noServer) {
+        if (this.#server) {
             // Start server and attach main event listeners
             this.#server.listen(port, hostname, () => {
                 console.log(`WebSocket server running at https://${hostname}:${port}`);
             });
 
             this.#server.on('upgrade', (req, socket, head) => { 
-                if (this.validRoute(req)) {
+                if (this.#correctRoute(req)) {
                     this.handleUpgrade(req, socket, head);
                 } else {
-                    this.abort(404, socket);
+                    this.#abort(404, socket);
                 }
             });
         }
     }
 
     handleUpgrade(req: IncomingMessage, socket: TLSSocket, head: Buffer): void {
-        if (this.originInvalid(req)) {
-            this.abort(403, socket);
-        } else if (this.badRequest(req)) {
-            this.abort(400, socket);
-        } else if (this.versionInvalid(req)) {
-            this.abort(426, socket, ['Sec-Websocket-Version: 13']);
+        if (!this.#originValid(req)) {
+            this.#abort(403, socket);
+        } else if (!this.#requestValid(req)) {
+            this.#abort(400, socket);
+        } else if (!this.#versionValid(req)) {
+            this.#abort(426, socket, ['Sec-Websocket-Version: 13']);
         } else {
-            this.upgrade(req, socket);
+            this.#upgrade(req, socket);
         }
     }
 
     // don't forget binding socket (data events no longer emitted)
-    upgrade(req: IncomingMessage, socket: TLSSocket): void {
+    #upgrade(req: ValidRequest, socket: TLSSocket): void {
         const headers: string[] = [
             'Upgrade: websocket', 
             'Connection: Upgrade'
         ];
 
         // add the 'Sec-WebSocket-Accept' value to the header
-        const acceptValue = generateSecWebSocketAccept(req.headers["sec-websocket-key"]);
+        const acceptValue = this.#generateSecWebSocketAccept(req.headers["sec-websocket-key"]);
         headers.push(`Sec-WebSocket-Accept: ${acceptValue}`);
 
         // negotiate protocol 
@@ -102,7 +97,7 @@ export default class WebSocketServer extends EventEmitter {
         // but the IncomingMessage object only has one potential protocol, and is handled as such.
 
         const requestedProtocol = req.headers["sec-websocket-protocol"];
-        if (this.#subProtocols?.includes(requestedProtocol)) {
+        if (requestedProtocol && this.#subProtocols?.includes(requestedProtocol)) {
             headers.push(`Sec-WebSocket-Protocol: ${requestedProtocol}`);
         }
         
@@ -116,70 +111,83 @@ export default class WebSocketServer extends EventEmitter {
         this.emit('connection', ws);
     }
 
-    abort(statusCode: number, socket: TLSSocket, headers?: string[]): void {
+    #abort(statusCode: number, socket: TLSSocket, headers?: string[]): void {
         const res = formatHttpResponse(statusCode, headers);
         socket.write(res, 'utf-8');
         socket.end();
     }
 
-    versionInvalid(req: IncomingMessage): boolean {
-        return req.headers["sec-websocket-version"] !== '13';
+    #versionValid(req: IncomingMessage): boolean {
+        return req.headers["sec-websocket-version"] === '13';
     }
 
-    originInvalid(req: IncomingMessage): boolean {
+    #originValid(req: IncomingMessage): boolean {
         const reqOrigin = req.headers.origin;
 
         if (reqOrigin && this.#origins) {
-            return !this.#origins.includes(reqOrigin);
+            return this.#origins.includes(reqOrigin);
         }
 
         // if an origin is required (i.e. client must be a browser), 
-        // return true (i.e. 'invalid') if no origin was found
+        // return false if no origin was found
         if (this.#requireOrigin && !reqOrigin) {
-            return true;
+            return false;
         } 
             
         // if no origins are specified, all origins are accepted
-        return false;  
+        return true;  
     }
 
-    badRequest(req: IncomingMessage): boolean {
-        if (Number(req.httpVersion) < 1.1) return true;
+    #requestValid(req: IncomingMessage): req is ValidRequest {
+        if (Number(req.httpVersion) < 1.1) return false;
 
-        if (req.method !== 'GET') return true;
+        if (req.method !== 'GET') return false;
 
-        if (!req.url) return true;
+        if (!req.url) return false;
         
         //if (req.headers.host !== Server's Authority) return true;
 
-        if (req.headers.upgrade !== 'websocket') return true;
+        if (req.headers.upgrade !== 'websocket') return false;
 
-        if (req.headers.connection !== 'upgrade') return true;
+        if (req.headers.connection !== 'upgrade') return false;
 
-        if (this.invalidKey(req.headers["sec-websocket-key"])) return true;
+        const key = req.headers["sec-websocket-key"];
+        if (!key || !this.#keyValid(key)) return false;
 
-        return false;
+        return true;
     }
 
-    invalidKey(key: string): boolean {
+    #keyValid(key: string): boolean {
         // must be base64 encoded
-        if (!isBase64Encoded(key)) return true;
+        if (!isBase64Encoded(key)) return false;
 
         // must be 16 bytes when decoded
-        if (key.length !== 24) return true;
-        if (key.substring(22) !== '==') return true;
+        if (key.length !== 24) return false;
+        if (key.substring(22) !== '==') return false;
 
-        return false;
+        return true;
+    }
+
+    #generateSecWebSocketAccept(key: string): string {
+        const concatenated = key.concat(GUID);
+    
+        const hash = crypto.createHash('sha1');
+        hash.update(concatenated, 'base64');
+        const buffer = hash.digest();
+    
+        return buffer.toString('base64');
     }
 
     // the ':' prefix to a path segment indicates a wildcard route
-    isWildcard(route: Pathname): boolean {
+    #isWildcard(route: Pathname): boolean {
         // find index of last '/' character; the next character must be ':' for true
         const i = lastSlash(route);
         return route[i + 1] === ':';
     }
 
-    validRoute(req: IncomingMessage): boolean {
+    #correctRoute(req: IncomingMessage): boolean {
+        if (!req.url) return false;
+        
         const url = new URL(req.url, `https://${req.headers.host}`);
         const pathname = url.pathname;
 
