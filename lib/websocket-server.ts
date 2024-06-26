@@ -30,7 +30,7 @@ export default class WebSocketServer extends EventEmitter {
     #server: Server | null;
     #serviceRoute: Pathname;
     #wildcardRoute: boolean;
-    //#activeConnections: ConnectionList;
+    #activeConnections: ConnectionList;
 
     constructor(server: Server | null, route: Pathname, options?: WSSOptions) { 
         super();
@@ -51,6 +51,7 @@ export default class WebSocketServer extends EventEmitter {
         this.#server = server;
         this.#serviceRoute = route;
         this.#wildcardRoute = this.#isWildcard(route);
+        this.#activeConnections = this.#wildcardRoute ? {} : [];
         
         if (this.#server) {
             // Start server and attach main event listeners
@@ -68,6 +69,18 @@ export default class WebSocketServer extends EventEmitter {
         }
     }
 
+    // if a uri is provided, get all WebSockets at that uri
+    // if no uri is provided, it is assumed that there is no wildcard route and this returns all connected WebSockets
+    getPeers(uri?: string): WebSocket[] {
+        if (Array.isArray(this.#activeConnections)) {
+            return this.#activeConnections;
+        } else if (uri) {
+            return this.#activeConnections[uri];
+        } else {
+            throw('Error: getPeers() expects a URI argument for a WebSocketServer of a wildcard route.');
+        }
+    }
+
     handleUpgrade(req: IncomingMessage, socket: TLSSocket, head: Buffer): void {
         if (!this.#originValid(req)) {
             this.#abort(403, socket);
@@ -82,33 +95,63 @@ export default class WebSocketServer extends EventEmitter {
 
     // don't forget binding socket (data events no longer emitted)
     #upgrade(req: ValidRequest, socket: TLSSocket): void {
+        // Create new WebSocket
+        const url = new URL(req.url, `https://${req.headers.host}`);
+        const ws = new WebSocket(socket, url.pathname as Pathname); 
+
+        // Keep track of connection and emit the connection event
+        this.#addConnection(ws);
+        this.emit('connection', ws);
+
+        // Send response handshake (101 Switching Protocols)
+        const headers = this.#generateHeaders(req);
+        const res = formatHttpResponse(101, headers);
+        socket.write(res, 'utf-8');
+    }
+
+    #addConnection(ws: WebSocket): void {
+        if (Array.isArray(this.#activeConnections)) {
+            // all WebSockets are connected to the same endpoint
+            this.#activeConnections.push(ws);
+        } else {
+            // the WebSocket should be in an array with those connected to the same wildcard endpoint
+            const wildcardStartIndex = lastSlash(ws.uri) + 1;
+            const wildcardEndpoint = ws.uri.substring(wildcardStartIndex);
+            this.#activeConnections[wildcardEndpoint].push(ws);
+        }
+    }
+
+    #generateHeaders(req: ValidRequest): string[] {
         const headers: string[] = [
             'Upgrade: websocket', 
             'Connection: Upgrade'
         ];
 
-        // add the 'Sec-WebSocket-Accept' value to the header
+        // add the 'Sec-WebSocket-Accept' value to the headers
         const acceptValue = this.#generateSecWebSocketAccept(req.headers["sec-websocket-key"]);
         headers.push(`Sec-WebSocket-Accept: ${acceptValue}`);
 
         // negotiate protocol 
 
         // RFC 6455 specifies that the client can list multiple protocols in order of preference, 
-        // but the IncomingMessage object only has one potential protocol, and is handled as such.
+        // however the IncomingMessage object only lists a single potential protocol, and is handled as such.
 
         const requestedProtocol = req.headers["sec-websocket-protocol"];
         if (requestedProtocol && this.#subProtocols?.includes(requestedProtocol)) {
             headers.push(`Sec-WebSocket-Protocol: ${requestedProtocol}`);
         }
-        
-        // 101 Switching Protocols
-        const res = formatHttpResponse(101, headers);
-        socket.write(res, 'utf-8');
 
-        // emit the connection event and pass the newly created WebSocket to the callback
-        const url = new URL(req.url, `https://${req.headers.host}`);
-        const ws = new WebSocket(socket, url.pathname); 
-        this.emit('connection', ws);
+        return headers;
+    }
+
+    #generateSecWebSocketAccept(key: string): string {
+        const concatenated = key.concat(GUID);
+    
+        const hash = crypto.createHash('sha1');
+        hash.update(concatenated, 'base64');
+        const buffer = hash.digest();
+    
+        return buffer.toString('base64');
     }
 
     #abort(statusCode: number, socket: TLSSocket, headers?: string[]): void {
@@ -168,22 +211,14 @@ export default class WebSocketServer extends EventEmitter {
         return true;
     }
 
-    #generateSecWebSocketAccept(key: string): string {
-        const concatenated = key.concat(GUID);
-    
-        const hash = crypto.createHash('sha1');
-        hash.update(concatenated, 'base64');
-        const buffer = hash.digest();
-    
-        return buffer.toString('base64');
-    }
-
     // the ':' prefix to a path segment indicates a wildcard route
     #isWildcard(route: Pathname): boolean {
         // find index of last '/' character; the next character must be ':' for true
         const i = lastSlash(route);
         return route[i + 1] === ':';
     }
+
+    // this is the single wildcard (at the end of the path only) interpretation
 
     #correctRoute(req: IncomingMessage): boolean {
         if (!req.url) return false;
@@ -193,51 +228,77 @@ export default class WebSocketServer extends EventEmitter {
 
         // j = 1, i = 1 to skip '/' prefix
         let j = 1;
-        let skipToNextSegment = false;
         const slashIndex = lastSlash(this.#serviceRoute);
         for (let i = 1; i < pathname.length; i++) {
-        
-            // increment indexes to next '/' in each string
-            while (skipToNextSegment) {
-                if (pathname[i] === '/' && this.#serviceRoute[j] === '/') {
-                    skipToNextSegment = false;
-                    continue;
-                } 
-
-                if (pathname[i] === '/' && this.#serviceRoute[j] !== '/') {
-                    j++;
-                }
-
-                if (pathname[i] !== '/' && this.#serviceRoute[j] === '/') {
-                    i++;
-                }
-
-                if (pathname[i] !== '/' && this.#serviceRoute[j] !== '/') {
-                    i++;
-                    j++;
-                }
+            // for a route with a trailing wildcard, break once the last slash is reached,
+            // as the route is valid the rest of the way
+            if (i === slashIndex && this.#wildcardRoute) {
+                break;
             }
 
-            // skip any wildcards
-            if (this.#serviceRoute[j] === ':' && (j - 1) !== slashIndex) {
-                skipToNextSegment = true;
-                continue;
-            }
-
-            // if we've reached the final wildcard segment, the route is valid
-            if (this.#serviceRoute[j] === ':') {
-                return true;
-            }
-
-            // if non-wildcard path segments are not identical, the route is invalid
             if (pathname[i] !== this.#serviceRoute[j]) {
                 return false;
             }
-
-            j++;
         }
 
         return true;
     }
+
+    // Below is the multiple wildcard route interpretation
+
+    // #correctRoute(req: IncomingMessage): boolean {
+    //     if (!req.url) return false;
+        
+    //     const url = new URL(req.url, `https://${req.headers.host}`);
+    //     const pathname = url.pathname;
+
+    //     // j = 1, i = 1 to skip '/' prefix
+    //     let j = 1;
+    //     let skipToNextSegment = false;
+    //     const slashIndex = lastSlash(this.#serviceRoute);
+    //     for (let i = 1; i < pathname.length; i++) {
+        
+    //         // increment indexes to next '/' in each string
+    //         while (skipToNextSegment) {
+    //             if (pathname[i] === '/' && this.#serviceRoute[j] === '/') {
+    //                 skipToNextSegment = false;
+    //                 continue;
+    //             } 
+
+    //             if (pathname[i] === '/' && this.#serviceRoute[j] !== '/') {
+    //                 j++;
+    //             }
+
+    //             if (pathname[i] !== '/' && this.#serviceRoute[j] === '/') {
+    //                 i++;
+    //             }
+
+    //             if (pathname[i] !== '/' && this.#serviceRoute[j] !== '/') {
+    //                 i++;
+    //                 j++;
+    //             }
+    //         }
+
+    //         // skip any wildcards
+    //         if (this.#serviceRoute[j] === ':' && (j - 1) !== slashIndex) {
+    //             skipToNextSegment = true;
+    //             continue;
+    //         }
+
+    //         // if we've reached the final wildcard segment, the route is valid
+    //         if (this.#serviceRoute[j] === ':') {
+    //             return true;
+    //         }
+
+    //         // if non-wildcard path segments are not identical, the route is invalid
+    //         if (pathname[i] !== this.#serviceRoute[j]) {
+    //             return false;
+    //         }
+
+    //         j++;
+    //     }
+
+    //     return true;
+    // }
 
 }

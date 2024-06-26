@@ -26,7 +26,7 @@ export type ConnectionList = WebSocket[] | { [wildcardId: string]: WebSocket[] }
 
 export type ValidRequest = IncomingMessage & { 
     'url': string, 
-    headers: {
+    'headers': {
         'sec-websocket-key': string 
     }
 };
