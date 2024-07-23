@@ -24,7 +24,7 @@ export default class WebSocketServer extends EventEmitter {
     // options
     #origins: string[] | undefined;
     #requireOrigin: boolean;
-    #subProtocols: string[] | undefined;
+    #subprotocols: string[] | undefined;
 
     // server & metadata
     #server: Server | null;
@@ -38,14 +38,14 @@ export default class WebSocketServer extends EventEmitter {
         const optionValues = {
             origins: undefined,
             requireOrigin: false,
-            subProtocols: undefined,
+            subprotocols: undefined,
             ...options
         };
 
         // options
         this.#origins = optionValues.origins;
         this.#requireOrigin = optionValues.requireOrigin;
-        this.#subProtocols = optionValues.subProtocols;
+        this.#subprotocols = optionValues.subprotocols;
 
         // server & metadata
         this.#server = server;
@@ -69,8 +69,8 @@ export default class WebSocketServer extends EventEmitter {
         }
     }
 
-    // if a uri is provided, get all WebSockets at that uri
-    // if no uri is provided, it is assumed that there is no wildcard route and this returns all connected WebSockets
+    // if activeConnections is an array, return it, as there is a single endpoint
+    // if a uri is provided, get all WebSockets at that specific uri, as there are multiple possible endpoints
     getPeers(uri?: string): WebSocket[] {
         if (Array.isArray(this.#activeConnections)) {
             return this.#activeConnections;
@@ -91,6 +91,12 @@ export default class WebSocketServer extends EventEmitter {
         } else {
             this.#upgrade(req, socket);
         }
+    }
+
+    #abort(statusCode: number, socket: TLSSocket, headers?: string[]): void {
+        const res = formatHttpResponse(statusCode, headers);
+        socket.write(res, 'utf-8');
+        socket.end();
     }
 
     // don't forget binding socket (data events no longer emitted)
@@ -122,6 +128,7 @@ export default class WebSocketServer extends EventEmitter {
     }
 
     #generateHeaders(req: ValidRequest): string[] {
+        // constant headers
         const headers: string[] = [
             'Upgrade: websocket', 
             'Connection: Upgrade'
@@ -131,37 +138,99 @@ export default class WebSocketServer extends EventEmitter {
         const acceptValue = this.#generateSecWebSocketAccept(req.headers["sec-websocket-key"]);
         headers.push(`Sec-WebSocket-Accept: ${acceptValue}`);
 
-        // negotiate protocol 
-
-        // RFC 6455 specifies that the client can list multiple protocols in order of preference, 
-        // however the IncomingMessage object only lists a single potential protocol, and is handled as such.
-
-        const requestedProtocol = req.headers["sec-websocket-protocol"];
-        if (requestedProtocol && this.#subProtocols?.includes(requestedProtocol)) {
-            headers.push(`Sec-WebSocket-Protocol: ${requestedProtocol}`);
+        // negotiate subprotocol 
+        const protocols = req.headers["sec-websocket-protocol"];
+        if (protocols) {
+            const selectedProtocol = this.#selectProtocol(protocols);
+            if (selectedProtocol) {
+                headers.push(`Sec-WebSocket-Protocol: ${selectedProtocol}`);
+            }
         }
 
         return headers;
     }
 
+    /* 
+     * Spec [ALGORITHM]
+     * Sec-WebSocket-Accept
+     * RFC 6455 Section 4.2.2, bullet 5, sub-bullet 4 
+     */
     #generateSecWebSocketAccept(key: string): string {
-        const concatenated = key.concat(GUID);
+        const trimmed = key.trim();                       // remove any leading/trailing whitespace
+        const concatenated = trimmed.concat(GUID);        // concatenate the GUID
     
-        const hash = crypto.createHash('sha1');
+        const hash = crypto.createHash('sha1');           // create/update/digest hash
         hash.update(concatenated, 'base64');
         const buffer = hash.digest();
     
-        return buffer.toString('base64');
+        return buffer.toString('base64');                 // convert buffer to base64 and return
     }
 
-    #abort(statusCode: number, socket: TLSSocket, headers?: string[]): void {
-        const res = formatHttpResponse(statusCode, headers);
-        socket.write(res, 'utf-8');
-        socket.end();
+    /*
+     * Spec [VALUE SELECTION]
+     * Sec-WebSocket-Protocol
+     * RFC 6455 Section 4.2.1 bullet 8
+     * 
+     * Specifies that the client can list multiple protocols in order of preference, 
+     * with the protocols listed from most preferred to least preferred. The server 
+     * will select the client's most preferred option out of the supported protocols, 
+     * if it exists. 
+     */
+    #selectProtocol(protocols: string): string | undefined {
+        const protocolArray = protocols.split(', ');
+
+        for (let i = 0; i < protocolArray.length; i++) {
+            if (this.#subprotocols?.includes(protocolArray[i])) {
+                return protocolArray[i];
+            }
+        }
+
+        return;
     }
 
+    /* 
+     * Spec [VALUE]
+     * Sec-WebSocket-Version
+     * RFC 6455 Section 4.2.1 bullet 6
+     */
     #versionValid(req: IncomingMessage): boolean {
         return req.headers["sec-websocket-version"] === '13';
+    }
+
+    /* 
+     * Spec [GENERAL]
+     * Requirements universal to all client handshakes
+     * RFC 6455 Section 4.2.1 bullets 1 - 5
+     */
+    #requestValid(req: IncomingMessage): req is ValidRequest {
+        if (Number(req.httpVersion) < 1.1 ||
+        req.method !== 'GET' ||
+        req.headers.upgrade !== 'websocket' ||
+        req.headers.connection !== 'upgrade' ||
+        !req.url ||
+        !req.headers["sec-websocket-key"] ||
+        !this.#keyValid(req.headers["sec-websocket-key"])) {
+            return false;
+        } 
+        //if (req.headers.host !== Server's Authority) return true;
+ 
+        return true;
+    }
+
+    /* 
+     * Spec [VALUE]
+     * Sec-WebSocket-Key 
+     * RFC 6455 Section 4.2.1 bullet 5
+     */
+    #keyValid(key: string): boolean {
+        // must be base64 encoded
+        if (!isBase64Encoded(key)) return false;
+
+        // must be 16 bytes when decoded
+        if (key.length !== 24) return false;
+        if (key.substring(22) !== '==') return false;
+
+        return true;
     }
 
     #originValid(req: IncomingMessage): boolean {
@@ -181,35 +250,6 @@ export default class WebSocketServer extends EventEmitter {
         return true;  
     }
 
-    #requestValid(req: IncomingMessage): req is ValidRequest {
-        if (Number(req.httpVersion) < 1.1) return false;
-
-        if (req.method !== 'GET') return false;
-
-        if (!req.url) return false;
-        
-        //if (req.headers.host !== Server's Authority) return true;
-
-        if (req.headers.upgrade !== 'websocket') return false;
-
-        if (req.headers.connection !== 'upgrade') return false;
-
-        const key = req.headers["sec-websocket-key"];
-        if (!key || !this.#keyValid(key)) return false;
-
-        return true;
-    }
-
-    #keyValid(key: string): boolean {
-        // must be base64 encoded
-        if (!isBase64Encoded(key)) return false;
-
-        // must be 16 bytes when decoded
-        if (key.length !== 24) return false;
-        if (key.substring(22) !== '==') return false;
-
-        return true;
-    }
 
     // the ':' prefix to a path segment indicates a wildcard route
     #isWildcard(route: Pathname): boolean {
